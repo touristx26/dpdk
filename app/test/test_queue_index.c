@@ -7,8 +7,8 @@
 
 #include <rte_cycles.h>
 #include <rte_lcore.h>
+#include <rte_memory.h>
 #include <rte_ring.h>
-#include <rte_socket.h>
 #include <rte_queue_index.h>
 
 #include "test.h"

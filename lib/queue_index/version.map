@@ -1,6 +1,7 @@
 EXPERIMENTAL {
 	global:
 
+	# added in 24.11
 	rte_qi_fini;
 	rte_qi_generation;
 	rte_qi_init;
