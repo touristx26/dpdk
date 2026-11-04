@@ -16,6 +16,7 @@ libraries = [
         'eal', # everything depends on eal
         'ptr_compress',
         'ring',
+        'queue_index', # depends on ring
         'rcu', # rcu depends on ring
         'mempool',
         'mbuf',

@@ -1,0 +1,20 @@
+EXPERIMENTAL {
+	global:
+
+	rte_qi_fini;
+	rte_qi_generation;
+	rte_qi_init;
+	rte_qi_monitor_status;
+	rte_qi_process_at;
+	rte_qi_ring_handle_get;
+	rte_qi_ring_register;
+	rte_qi_ring_register_ptr;
+	rte_qi_ring_unregister;
+	rte_qi_start;
+	rte_qi_state_get;
+	rte_qi_state_get_by_idx;
+	rte_qi_state_list_warn;
+	rte_qi_stop;
+
+	local: *;
+};
