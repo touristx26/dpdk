@@ -27,6 +27,7 @@
 #include "rte_queue_index.h"
 
 RTE_LOG_REGISTER_DEFAULT(queue_index_logtype, INFO);
+#define RTE_LOGTYPE_QUEUE_INDEX queue_index_logtype
 
 #define QI_MAX_WINDOW 64
 #define QI_SAMPLE_COST_NS 100
@@ -582,21 +583,21 @@ qi_log_transition(struct qi_slot *slot, uint64_t now,
 		return;
 
 	if (st->state == RTE_QI_CRITICAL)
-		RTE_LOG(ERR, queue_index_logtype,
+		RTE_LOG(ERR, QUEUE_INDEX,
 			"ring=%s state=CRITICAL prev=%d reasons=0x%x "
 			"count=%"PRIu32"/%"PRIu32" enq=%"PRIu64"pps "
 			"deq=%"PRIu64"pps net=%"PRIu64"pps eta=%"PRIu64"us\n",
 			st->name, prev, st->reasons, st->count_hi, st->capacity,
 			st->enq_pps, st->deq_pps, st->net_pps, st->eta_us);
 	else if (st->state == RTE_QI_WARN)
-		RTE_LOG(WARNING, queue_index_logtype,
+		RTE_LOG(WARNING, QUEUE_INDEX,
 			"ring=%s state=WARN prev=%d reasons=0x%x "
 			"count=%"PRIu32"/%"PRIu32" enq=%"PRIu64"pps "
 			"deq=%"PRIu64"pps net=%"PRIu64"pps eta=%"PRIu64"us\n",
 			st->name, prev, st->reasons, st->count_hi, st->capacity,
 			st->enq_pps, st->deq_pps, st->net_pps, st->eta_us);
 	else
-		RTE_LOG(NOTICE, queue_index_logtype,
+		RTE_LOG(NOTICE, QUEUE_INDEX,
 			"ring=%s state=OK prev=%d count=%"PRIu32"/%"PRIu32"\n",
 			st->name, prev, st->count_hi, st->capacity);
 }
@@ -936,26 +937,26 @@ rte_qi_init(const char *kvargs)
 	}
 
 	if (qi_check_conf(&qi_conf.ring) < 0) {
-		RTE_LOG(ERR, queue_index_logtype,
+		RTE_LOG(ERR, QUEUE_INDEX,
 			"invalid global configuration\n");
 		return -EINVAL;
 	}
 
 	if (qi_conf.budget_pct < 1 || qi_conf.budget_pct > 100) {
-		RTE_LOG(ERR, queue_index_logtype,
+		RTE_LOG(ERR, QUEUE_INDEX,
 			"budget_pct must be in [1, 100]\n");
 		return -EINVAL;
 	}
 
 	if (qi_conf.log_rate > 100000) {
-		RTE_LOG(ERR, queue_index_logtype,
+		RTE_LOG(ERR, QUEUE_INDEX,
 			"log_rate is too large\n");
 		return -EINVAL;
 	}
 
 	qi_mon.tsc_hz = rte_get_tsc_hz();
 	if (qi_mon.tsc_hz == 0) {
-		RTE_LOG(ERR, queue_index_logtype, "invalid TSC frequency\n");
+		RTE_LOG(ERR, QUEUE_INDEX, "invalid TSC frequency\n");
 		return -EINVAL;
 	}
 
@@ -1046,7 +1047,7 @@ rte_qi_start(void)
 
 	lcore = qi_resolve_lcore(&err);
 	if (lcore < 0) {
-		RTE_LOG(ERR, queue_index_logtype,
+		RTE_LOG(ERR, QUEUE_INDEX,
 			"no usable monitor lcore (err=%d)\n", err);
 		return err;
 	}
@@ -1065,7 +1066,7 @@ rte_qi_start(void)
 	rte_rwlock_read_unlock(&qi_lock);
 
 	if (pct > (double)qi_conf.budget_pct) {
-		RTE_LOG(ERR, queue_index_logtype,
+		RTE_LOG(ERR, QUEUE_INDEX,
 			"estimated monitor CPU %.1f%% exceeds budget %u%% "
 			"(%u rings)\n",
 			pct, qi_conf.budget_pct, n_rings);
@@ -1096,12 +1097,12 @@ rte_qi_start(void)
 		rte_atomic_store_explicit(&qi_mon.running, 0,
 					  rte_memory_order_release);
 		qi_mon.lcore = UINT32_MAX;
-		RTE_LOG(ERR, queue_index_logtype,
+		RTE_LOG(ERR, QUEUE_INDEX,
 			"failed to launch monitor on lcore %d\n", lcore);
 		return -EBUSY;
 	}
 
-	RTE_LOG(INFO, queue_index_logtype,
+	RTE_LOG(INFO, QUEUE_INDEX,
 		"monitor started on lcore %d, %u rings, interval %u us, "
 		"estimated CPU %.1f%%\n",
 		lcore, n_rings, qi_conf.ring.interval_us, pct);
@@ -1120,7 +1121,7 @@ rte_qi_stop(void)
 		return 0;
 
 	if (rte_lcore_id() == qi_mon.lcore) {
-		RTE_LOG(ERR, queue_index_logtype,
+		RTE_LOG(ERR, QUEUE_INDEX,
 			"cannot stop the monitor from its own lcore\n");
 		return -EINVAL;
 	}
@@ -1166,7 +1167,7 @@ rte_qi_ring_register_ptr(struct rte_ring *ring, const char *alias,
 
 	if (rte_ring_get_prod_sync_type(ring) == RTE_RING_SYNC_MT_RTS ||
 	    rte_ring_get_cons_sync_type(ring) == RTE_RING_SYNC_MT_RTS) {
-		RTE_LOG(ERR, queue_index_logtype,
+		RTE_LOG(ERR, QUEUE_INDEX,
 			"RTS sync mode is not supported\n");
 		return -ENOTSUP;
 	}
