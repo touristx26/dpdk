@@ -59,6 +59,16 @@ struct qi_sample {
 	uint32_t count_hi;
 };
 
+struct qi_slot;
+
+/**
+ * Predictor: derive the net accumulation rate (in packets per second) and
+ * the estimated time to full (in microseconds) from the sample window.
+ */
+typedef void (*qi_predict_fn)(struct qi_slot *slot, uint64_t now,
+			      uint32_t count_hi, uint64_t *net_pps,
+			      uint64_t *eta_us);
+
 struct qi_slot {
 	RTE_ATOMIC(uint32_t) seq;
 	RTE_ATOMIC(uint32_t) in_use;
@@ -66,6 +76,8 @@ struct qi_slot {
 	char name[RTE_RING_NAMESIZE];
 	struct rte_qi_conf conf;
 	uint64_t interval_tsc;
+	qi_predict_fn predict;
+	int64_t net_ewma;
 	struct qi_sample win[QI_MAX_WINDOW];
 	uint32_t win_head;
 	uint32_t win_cnt;
@@ -120,6 +132,7 @@ static const char * const qi_valid_keys[] = {
 	"confirm_samples",
 	"min_net_pps",
 	"hold_us",
+	"predictor",
 	"stagger",
 	"budget_pct",
 	"log",
@@ -319,6 +332,18 @@ qi_parse_param(const char *key, const char *value, void *opaque)
 		return 0;
 	}
 
+	if (strcmp(key, "predictor") == 0) {
+		if (strcmp(value, "peak") == 0)
+			conf->ring.predictor = RTE_QI_PRED_PEAK;
+		else if (strcmp(value, "ewma") == 0)
+			conf->ring.predictor = RTE_QI_PRED_EWMA;
+		else if (strcmp(value, "linreg") == 0)
+			conf->ring.predictor = RTE_QI_PRED_LINREG;
+		else
+			return -EINVAL;
+		return 0;
+	}
+
 	if (strcmp(key, "stagger") == 0)
 		return qi_parse_bool(value, &conf->stagger);
 
@@ -361,6 +386,9 @@ qi_check_conf(const struct rte_qi_conf *conf)
 		return -EINVAL;
 	if (conf->confirm_samples < 1 || conf->confirm_samples > QI_MAX_WINDOW)
 		return -EINVAL;
+	if (conf->predictor < RTE_QI_PRED_PEAK ||
+	    conf->predictor > RTE_QI_PRED_LINREG)
+		return -EINVAL;
 
 	return 0;
 }
@@ -379,6 +407,7 @@ qi_defaults(void)
 		.confirm_samples = 2,
 		.hold_us = 0,
 		.min_net_pps = 100000,
+		.predictor = RTE_QI_PRED_PEAK,
 	};
 	qi_conf.min_interval_us = 5;
 	qi_conf.spin_us = 0;
@@ -416,6 +445,8 @@ qi_fill_conf(struct rte_qi_conf *dst, const struct rte_qi_conf *src)
 		dst->hold_us = src->hold_us;
 	if (src->min_net_pps != 0)
 		dst->min_net_pps = src->min_net_pps;
+	if (src->predictor != 0)
+		dst->predictor = src->predictor;
 }
 
 static void
@@ -498,8 +529,7 @@ qi_read_counters(struct rte_ring *ring, uint32_t *prod_head,
 
 static void
 qi_compute_rates(const struct qi_slot *slot, uint64_t now,
-		 uint64_t *enq_pps, uint64_t *deq_pps,
-		 uint64_t *peak_net_pps, uint32_t *peak_hi)
+		 uint64_t *enq_pps, uint64_t *deq_pps, uint32_t *peak_hi)
 {
 	const struct qi_sample *win = slot->win;
 	uint32_t window = slot->conf.window;
@@ -509,7 +539,6 @@ qi_compute_rates(const struct qi_slot *slot, uint64_t now,
 
 	*enq_pps = 0;
 	*deq_pps = 0;
-	*peak_net_pps = 0;
 	*peak_hi = 0;
 
 	if (count == 0)
@@ -535,26 +564,159 @@ qi_compute_rates(const struct qi_slot *slot, uint64_t now,
 
 	*enq_pps = qi_rate(win[last].prod_tail - win[first].prod_tail, span);
 	*deq_pps = qi_rate(win[last].cons_tail - win[first].cons_tail, span);
-
-	for (i = 1; i < count; i++) {
-		uint32_t prev = (first + i - 1) % window;
-		uint32_t cur = (first + i) % window;
-		uint64_t delta_tsc = win[cur].tsc - win[prev].tsc;
-		uint64_t enq, deq, net;
-
-		if (delta_tsc == 0)
-			continue;
-
-		enq = qi_rate(win[cur].prod_tail - win[prev].prod_tail,
-			      delta_tsc);
-		deq = qi_rate(win[cur].cons_tail - win[prev].cons_tail,
-			      delta_tsc);
-		net = enq > deq ? enq - deq : 0;
-
-		if (net > *peak_net_pps)
-			*peak_net_pps = net;
-	}
 }
+
+/**
+ * Common ETA finishing rule shared by all predictors:
+ * a full ring has eta 0, a net rate below min_net_pps yields no prediction.
+ */
+static void
+qi_finish_eta(const struct qi_slot *slot, uint32_t count_hi,
+	      uint64_t net_pps, uint64_t *eta_us)
+{
+	uint32_t capacity = rte_ring_get_capacity(slot->ring);
+	uint32_t free_slots = capacity > count_hi ? capacity - count_hi : 0;
+
+	*eta_us = RTE_QI_ETA_INFINITE;
+	if (free_slots == 0)
+		*eta_us = 0;
+	else if (net_pps >= slot->conf.min_net_pps && net_pps > 0)
+		*eta_us = ((uint64_t)free_slots * 1000000ULL) / net_pps;
+}
+
+/**
+ * PEAK predictor: maximum of the per-interval net rates over the window.
+ * Fastest response to a sudden consumer stall; conservative under bursts.
+ */
+static void
+qi_predict_peak(struct qi_slot *slot, uint64_t now __rte_unused,
+		uint32_t count_hi, uint64_t *net_pps, uint64_t *eta_us)
+{
+	const struct qi_sample *win = slot->win;
+	uint32_t window = slot->conf.window;
+	uint32_t count = slot->win_cnt;
+	uint32_t first, i;
+	uint64_t peak_net = 0;
+
+	if (count >= 2) {
+		first = (slot->win_head + window - count) % window;
+		for (i = 1; i < count; i++) {
+			uint32_t prev = (first + i - 1) % window;
+			uint32_t cur = (first + i) % window;
+			uint64_t delta_tsc = win[cur].tsc - win[prev].tsc;
+			uint64_t enq, deq, net;
+
+			if (delta_tsc == 0)
+				continue;
+
+			enq = qi_rate(win[cur].prod_tail - win[prev].prod_tail,
+				      delta_tsc);
+			deq = qi_rate(win[cur].cons_tail - win[prev].cons_tail,
+				      delta_tsc);
+			net = enq > deq ? enq - deq : 0;
+
+			if (net > peak_net)
+				peak_net = net;
+		}
+	}
+
+	*net_pps = peak_net;
+	qi_finish_eta(slot, count_hi, peak_net, eta_us);
+}
+
+/**
+ * EWMA predictor: exponentially weighted moving average of the net rate
+ * with a fixed smoothing factor of 1/2 (state kept in the slot).
+ */
+static void
+qi_predict_ewma(struct qi_slot *slot, uint64_t now __rte_unused,
+		uint32_t count_hi, uint64_t *net_pps, uint64_t *eta_us)
+{
+	const struct qi_sample *win = slot->win;
+	uint32_t window = slot->conf.window;
+	uint32_t count = slot->win_cnt;
+	int64_t net_now = 0;
+
+	if (count >= 2) {
+		uint32_t last = (slot->win_head + window - 1) % window;
+		uint32_t prev = (slot->win_head + window - 2) % window;
+		uint64_t delta_tsc = win[last].tsc - win[prev].tsc;
+
+		if (delta_tsc > 0) {
+			int64_t enq = (int64_t)qi_rate(
+				win[last].prod_tail - win[prev].prod_tail,
+				delta_tsc);
+			int64_t deq = (int64_t)qi_rate(
+				win[last].cons_tail - win[prev].cons_tail,
+				delta_tsc);
+
+			net_now = enq - deq;
+		}
+	}
+
+	/* ewma = alpha * net_now + (1 - alpha) * ewma, with alpha = 1/2 */
+	slot->net_ewma = (slot->net_ewma + net_now) / 2;
+
+	*net_pps = slot->net_ewma > 0 ? (uint64_t)slot->net_ewma : 0;
+	qi_finish_eta(slot, count_hi, *net_pps, eta_us);
+}
+
+/**
+ * LINREG predictor: least-squares slope of the unclamped occupancy
+ * (prod_tail - cons_tail) over the window, in items per second.
+ * Best for slow drift; requires at least 3 samples.
+ */
+static void
+qi_predict_linreg(struct qi_slot *slot, uint64_t now __rte_unused,
+		  uint32_t count_hi, uint64_t *net_pps, uint64_t *eta_us)
+{
+	const struct qi_sample *win = slot->win;
+	uint32_t window = slot->conf.window;
+	uint32_t count = slot->win_cnt;
+	uint32_t first, i;
+	double sx = 0.0, sy = 0.0, sxx = 0.0, sxy = 0.0;
+	double denom, slope, net;
+
+	*net_pps = 0;
+	*eta_us = RTE_QI_ETA_INFINITE;
+
+	if (count < 3)
+		return;
+
+	first = (slot->win_head + window - count) % window;
+
+	/* x: elapsed cycles since the first sample,
+	 * y: unclamped occupancy (prod_tail - cons_tail). */
+	for (i = 0; i < count; i++) {
+		uint32_t idx = (first + i) % window;
+		double x = (double)(win[idx].tsc - win[first].tsc);
+		double y = (double)((int64_t)win[idx].prod_tail -
+				    (int64_t)win[idx].cons_tail);
+
+		sx += x;
+		sy += y;
+		sxx += x * x;
+		sxy += x * y;
+	}
+
+	denom = (double)count * sxx - sx * sx;
+	if (denom <= 0.0)
+		return;
+
+	slope = ((double)count * sxy - sx * sy) / denom; /* items per cycle */
+	net = slope * (double)qi_mon.tsc_hz;              /* items per second */
+	if (net <= 0.0 || net >= 1.8e19)
+		return;
+
+	*net_pps = (uint64_t)net;
+	qi_finish_eta(slot, count_hi, *net_pps, eta_us);
+}
+
+static const qi_predict_fn qi_predictors[RTE_QI_PRED_LINREG + 1] = {
+	[RTE_QI_PRED_PEAK] = qi_predict_peak,
+	[RTE_QI_PRED_EWMA] = qi_predict_ewma,
+	[RTE_QI_PRED_LINREG] = qi_predict_linreg,
+};
 
 static bool
 qi_log_allowed(struct qi_slot *slot, uint64_t now)
@@ -610,8 +772,8 @@ qi_sample_slot(struct qi_slot *slot, uint64_t now)
 	uint32_t prod_head, prod_tail, cons_tail;
 	uint32_t capacity, count_lo, count_hi, peak_hi;
 	uint32_t reasons = 0, prev_state, next_state;
-	uint64_t enq_pps = 0, deq_pps = 0, peak_net = 0, net_pps;
-	uint64_t eta_us, free_slots, now_ns;
+	uint64_t enq_pps = 0, deq_pps = 0, net_pps;
+	uint64_t eta_us, now_ns;
 	bool level, trend, full, recovery;
 
 	qi_read_counters(slot->ring, &prod_head, &prod_tail, &cons_tail);
@@ -633,16 +795,10 @@ qi_sample_slot(struct qi_slot *slot, uint64_t now)
 	if (slot->win_cnt < slot->conf.window)
 		slot->win_cnt++;
 
-	qi_compute_rates(slot, now, &enq_pps, &deq_pps, &peak_net, &peak_hi);
-	net_pps = enq_pps > deq_pps ? enq_pps - deq_pps : 0;
+	qi_compute_rates(slot, now, &enq_pps, &deq_pps, &peak_hi);
 
-	free_slots = capacity > count_hi ? capacity - count_hi : 0;
-	if (free_slots == 0)
-		eta_us = 0;
-	else if (peak_net >= slot->conf.min_net_pps && peak_net > 0)
-		eta_us = (free_slots * 1000000ULL) / peak_net;
-	else
-		eta_us = RTE_QI_ETA_INFINITE;
+	/* net_pps and eta_us come from the selected predictor. */
+	slot->predict(slot, now, count_hi, &net_pps, &eta_us);
 
 	level = capacity > 0 &&
 		(uint64_t)count_hi * 100 >=
@@ -1211,6 +1367,7 @@ rte_qi_ring_register_ptr(struct rte_ring *ring, const char *alias,
 		qi_name_set(slot->name, name);
 		slot->conf = merged;
 		slot->interval_tsc = qi_us_to_tsc(merged.interval_us);
+		slot->predict = qi_predictors[merged.predictor];
 		slot->prev_state = RTE_QI_UNKNOWN;
 		slot->enter_state_ns = qi_tsc_to_ns(rte_rdtsc());
 		slot->next_due_tsc = rte_rdtsc();

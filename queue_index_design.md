@@ -175,6 +175,13 @@ enum rte_qi_reason {
     RTE_QI_REASON_FULL  = 1u << 2,   /* count_hi == capacity */
 };
 
+enum rte_qi_predictor {
+    RTE_QI_PRED_INHERIT = 0,   /* 仅 per-ring：继承全局 */
+    RTE_QI_PRED_PEAK,          /* 窗口峰值（默认） */
+    RTE_QI_PRED_EWMA,          /* 指数加权移动平均，α = 0.5 */
+    RTE_QI_PRED_LINREG,        /* 窗口内占用最小二乘斜率 */
+};
+
 /* 0 表示继承全局配置（仅 per-ring 使用） */
 struct rte_qi_conf {
     uint32_t high_wm;           /* 高水位百分比 */
@@ -186,6 +193,7 @@ struct rte_qi_conf {
     uint32_t confirm_samples;   /* 趋势条件连续确认次数 */
     uint32_t hold_us;           /* 最短保持时间 */
     uint64_t min_net_pps;       /* 趋势判断的最小净速率 */
+    uint32_t predictor;         /* 预测器选择，0 = 继承全局 */
 };
 
 struct rte_qi_ring_state {
@@ -198,7 +206,7 @@ struct rte_qi_ring_state {
     uint32_t peak_hi;        /* 窗口内高边界峰值 */
     uint64_t enq_pps;
     uint64_t deq_pps;
-    uint64_t net_pps;        /* 可为负，用 int64 语义输出时注意；见 §9.2 */
+    uint64_t net_pps;        /* 所选预测器给出的净堆积速率估计（≥ 0），见 §9.1/§9.2 */
     uint64_t eta_us;         /* RTE_QI_ETA_INFINITE 表示不收敛 */
     uint64_t ts_ns;          /* 本次采样时刻 */
     uint64_t warn_ts_ns;     /* 最近一次进入 WARN/CRITICAL 的时刻 */
@@ -217,7 +225,8 @@ struct rte_qi_monitor_status {
 };
 ```
 
-> `net_pps` 若为负（出队快于入队），内部按 0 处理并单独记录 `deq > enq` 的样本数，避免无符号语义问题。状态机不使用负速率。
+> `net_pps` 是所选预测器给出的净堆积速率估计，出队快于入队时按 0 处理
+>（EWMA 内部为 int64 状态、输出钳为非负），状态机不使用负速率。
 
 ### 7.2 内部结构
 
@@ -328,7 +337,8 @@ net_pps = enq_pps - deq_pps
 ```
 
 - 窗口未满时使用已有样本跨度（至少 2 个样本）；
-- `peak_net_pps` 取窗口内每个采样间隔净增量的最大值，用于 ETA，保证对突发保守；
+- `enq_pps` / `deq_pps` 为窗口端到端速率，仅用于展示与日志；
+- 净速率与 ETA 由所选预测器推导（见 §9.1），`PEAK` 即窗口内每个采样间隔净增量的最大值，保证对突发保守；
 - 速率计算使用双精度或 128 位中间量，避免 `Δitems × hz` 溢出（见 §17.3）。
 
 ### 8.4 误差分析
@@ -351,23 +361,69 @@ net_pps = enq_pps - deq_pps
 
 ## 9. 预测与状态机
 
-### 9.1 公式
+### 9.1 预测器
+
+预测器只负责从采样窗口推导 `net_pps` 与 `eta_us`；触发阈值、状态机、reasons 位图对所有预测器完全一致。切换预测器不改变任何阈值语义。
+
+```c
+typedef void (*qi_predict_fn)(struct qi_slot *slot, uint64_t now,
+                              uint32_t count_hi,
+                              uint64_t *net_pps, uint64_t *eta_us);
+
+static const qi_predict_fn qi_predictors[] = {
+    [RTE_QI_PRED_PEAK]   = qi_predict_peak,
+    [RTE_QI_PRED_EWMA]   = qi_predict_ewma,
+    [RTE_QI_PRED_LINREG] = qi_predict_linreg,
+};
+```
+
+注册时按 `conf.predictor`（继承解析后）把函数指针存进 slot，采样时直接调用。新增算法 = 新增一个表项。
+
+| 预测器 | net_pps 推导 | 适用场景 | 开销 |
+|---|---|---|---|
+| `PEAK`（默认） | 窗口内每个相邻采样对净速率的最大值 | 下游**阶跃停摆**（高速短 ring）：1~2 个 tick 得到真实净速率 | O(K)，无状态 |
+| `EWMA` | `ewma = (ewma + net_now) / 2`，α 固定 0.5，状态在 slot | **微突发常态**（突发但长期均衡）：平滑后误报显著降低，阶跃响应慢 3~4 个 tick | O(1)，8 字节状态 |
+| `LINREG` | 窗口内 `(tsc, prod_tail - cons_tail)` 最小二乘斜率 | **缓慢失配**（深 ring、长 horizon）：斜率稳定，ETA 更可信 | O(K)，复用窗口缓冲，零新增内存 |
+
+公共收尾规则 `qi_finish_eta()`（三个预测器共享）：
 
 ```
 free     = capacity - count_hi
-eta_us   = (peak_net_pps >= min_net_pps)
-           ? (free * 1e6) / peak_net_pps
+eta_us   = (free == 0) ? 0
+           : (net_pps >= min_net_pps) ? free * 1e6 / net_pps
+           : RTE_QI_ETA_INFINITE
+```
+
+选型依据是**故障时间常数**：微秒级阶跃 → PEAK；十微秒级突发 → EWMA；百微秒级漂移 → LINREG。同一 pipeline 中不同阶段的 ring 可各选各的（per-ring 覆盖）。
+
+各预测器的推荐 `window`：PEAK/EWMA 用 8（EWMA 自带平滑，窗口只影响展示速率）；LINREG 用 32（长窗稳斜率）。
+
+注意事项：
+
+- `net_pps` 发布值统一为所选预测器的估计（PEAK 下即窗口峰值净速率），与 `eta_us` 同源，应用看到的就是触发判断用的值；
+- EWMA 的 α 是唯一隐藏自由度，编译期固定 0.5，不进 API；实测不合适再暴露全局 kvargs；
+- LINREG 回归对象是未 clamp 的 `prod_tail - cons_tail`（u32 差值的 int64 语义），不受容量饱和段拉平斜率的影响；
+- LINREG 需要 ≥3 个样本，不足时 ETA 无穷；
+- 不实现 Holt：其场景（趋势+多步外推）被 LINREG 覆盖，双参数调优成本不划算。
+
+### 9.2 公式
+
+```
+free     = capacity - count_hi
+net_pred = predictor(slot)            /* PEAK / EWMA / LINREG */
+eta_us   = (net_pred >= min_net_pps)
+           ? (free * 1e6) / net_pred
            : RTE_QI_ETA_INFINITE
 level    = (count_hi * 100 >= high_wm * capacity)
 trend    = (eta_us <= warn_horizon_us)
 full     = (count_hi >= capacity)
 ```
 
-- ETA 使用窗口内**峰值**净速率，而不是平均值：突发场景下平均值会低估风险；
+- ETA 分母是预测器给出的净速率估计（PEAK 为窗口峰值），不是平均值：突发场景下平均值会低估风险；
 - 当 ring 已满时，成功的入队为 0，`net_pps` 会趋近 0，趋势判断失效，此时只能靠 `full` / 水位；
-- `count_hi` 为 0 且 `peak_net_pps` 很大时，ETA 可能瞬间很小，需靠 `confirm_samples` 抑制单点噪声。
+- `count_hi` 为 0 且 `net_pred` 很大时，ETA 可能瞬间很小，需靠 `confirm_samples` 抑制单点噪声。
 
-### 9.2 状态迁移
+### 9.3 状态迁移
 
 ```
                  首次采样
@@ -385,7 +441,7 @@ full     = (count_hi >= capacity)
       └──── 恢复条件连续 confirm_samples 次 ────────┘
 ```
 
-### 9.3 迁移条件
+### 9.4 迁移条件
 
 **进入 WARN**（从 OK/UNKNOWN）：
 
@@ -413,7 +469,7 @@ full     = (count_hi >= capacity)
 - `generation++`（release store）；
 - 输出日志（限流）。
 
-### 9.4 特殊场景
+### 9.5 特殊场景
 
 | 场景 | 处理 |
 |---|---|
@@ -637,11 +693,18 @@ struct rte_qi_conf conf = {
     .confirm_samples = 2,
     .hold_us = 0,
     .min_net_pps = 100000,
+    .predictor = RTE_QI_PRED_PEAK,   /* 0 = 继承全局 */
 };
 
-rte_qi_init("lcore=5,sched=spin,interval_us=10,budget_pct=50");
+rte_qi_init("lcore=5,sched=spin,interval_us=10,predictor=peak,budget_pct=50");
 rte_qi_ring_register("swq_0", &conf);
 rte_qi_ring_register("swq_1", NULL);   /* 全部继承全局 */
+
+/* 微突发常态的 ring 单独换 EWMA */
+struct rte_qi_conf ewma_conf = {
+    .predictor = RTE_QI_PRED_EWMA,
+};
+rte_qi_ring_register("swq_2", &ewma_conf);
 rte_qi_start();
 
 /* 控制面，每 50 µs 查一次 */
@@ -681,6 +744,7 @@ rte_qi_fini();
 | `confirm_samples` | uint32 | 2 | 1..64 | 趋势/恢复连续确认次数 |
 | `min_net_pps` | uint64 | 100000 | 0..UINT64_MAX | 趋势判断速率门限 |
 | `hold_us` | uint32 | 0 | 0..10000000 | 最短保持时间 |
+| `predictor` | enum | `peak` | `peak/ewma/linreg` | 全局默认预测器，见 §9.1 |
 | `stagger` | bool | 1 | 0/1 | 采样相位错开 |
 | `budget_pct` | uint32 | 50 | 1..100 | monitor 预估占用上限 |
 | `log` | bool | 1 | 0/1 | 是否输出迁移日志 |
@@ -696,9 +760,13 @@ rte_qi_fini();
 
 `rte_qi_ring_register*()` 的 `conf` 中字段为 0 表示继承全局；非 0 覆盖。可覆盖字段：
 
-`high_wm`、`low_wm`、`warn_horizon_us`、`clear_horizon_us`、`interval_us`、`window`、`confirm_samples`、`hold_us`、`min_net_pps`。
+`high_wm`、`low_wm`、`warn_horizon_us`、`clear_horizon_us`、`interval_us`、`window`、`confirm_samples`、`hold_us`、`min_net_pps`、`predictor`（0 = 继承全局预测器）。
 
 `conf == NULL` 表示全部继承。
+
+> ABI 注意：`predictor` 追加在 `rte_qi_conf` 末尾。库处于 EXPERIMENTAL 阶段，
+> 允许结构布局变更，但使用旧头文件编译的应用需重编译。转正式 ABI 后不得再
+> 直接追加字段，需改用带 size 的 v2 结构。
 
 ### 14.3 编译期固定项
 
@@ -707,16 +775,20 @@ rte_qi_fini();
 | `RTE_QI_MAX_RINGS` | 256 | 注册表上限 |
 | 窗口上限 | 64 | `window` 的最大值 |
 | 采样成本常数 | 100 ns | 预算估算用 |
+| EWMA α | 0.5 | 平滑因子，编译期固定，见 §9.1 |
+| LINREG 最小样本数 | 3 | 不足时 ETA 无穷 |
 | 支持同步模式 | MT/ST/HTS | RTS 拒绝 |
 
 ### 14.4 不同 ring 深度的推荐组合
 
-| capacity | interval_us | high_wm | warn_horizon_us |
-|---|---|---|---|
-| 1024 | 5 | 40 | 80 |
-| 2048 | 10 | 45 | 120 |
-| 4096 | 10 | 50 | 150 |
-| 8192 | 20 | 60 | 300 |
+| capacity | interval_us | high_wm | warn_horizon_us | predictor |
+|---|---|---|---|---|
+| 1024 | 5 | 40 | 80 | `peak` |
+| 2048 | 10 | 45 | 120 | `peak` |
+| 4096 | 10 | 50 | 150 | `peak`（默认） |
+| 8192 | 20 | 60 | 300 | `peak` / `linreg`（`window=32`） |
+
+按流量形态选择预测器（覆盖上表默认值）：下游阶跃停摆 → `peak`；微突发常态 → `ewma`；缓慢失配 → `linreg`（配 `window=32`）。
 
 ---
 
@@ -831,8 +903,9 @@ EXPERIMENTAL {
 | T8 | seqlock：单写多读压力，校验 `count_hi <= capacity`、`state` 合法 | 无非法值 |
 | T9 | 生命周期：重复 start、未 start 查询、stop 后查询 | 返回码与 `running` |
 | T10 | 预算校验：构造超预算 ring 数 | `-EINVAL` |
+| T11 | 预测器：`predictor` kvargs 解析（合法/非法值）；EWMA 阶跃堆积触发 TREND；LINREG 线性填充触发 TREND；net_pps/eta 与理论值一致 | 返回码、状态、`reasons` |
 
-时间注入：内部提供 `qi_process_at(uint64_t tsc)`，单测直接调用；对外不暴露。
+时间注入：内部提供 `qi_process_at(uint64_t tsc)`，单测直接调用；对外为 `rte_qi_process_at()`（实验接口，monitor 运行中 `-EBUSY`）。
 
 ### 17.2 集成测试
 
@@ -898,6 +971,7 @@ EXPERIMENTAL {
 | v1.1 | telemetry 命令（`/queue_index/rings`）读快照；异步日志 |
 | v1.2 | alarm ring（把迁移事件写入 `rte_ring`，供控制面异步消费） |
 | v1.3 | 每 socket 一个 monitor lcore，按 ring 归属分组 |
+| v1.4 | 自适应预测器：按窗口内净速率的突发度统计自动切换 PEAK↔EWMA（仅新增表项，不改 API） |
 | v2.0 | 自定义队列类型（`rte_qi_ring_ops` 采样回调）；RTS 支持；ring 自动发现（`rte_memzone_walk` + `RG_` 前缀） |
 
 ---
@@ -915,3 +989,7 @@ EXPERIMENTAL {
 | 参数数量 | 初期保留完整参数，后续收敛 | 便于调优和问题定位 |
 | RTS | v1 不支持 | 打包 64 位 tail，读取路径不同 |
 | 上报 | 查询 + 迁移日志 | 满足“标记 + 应用自取”的需求 |
+| 预测算法 | PEAK / EWMA / LINREG 三件套，函数指针表切换 | 对应阶跃 / 突发 / 漂移三类故障时间常数；查询契约不变 |
+| Holt | 不实现 | 场景被 LINREG 覆盖，α/β 双参数调优成本不划算 |
+| EWMA α | 编译期固定 0.5，不进 API | 10 µs 窗口无调优经验可依；需要时再暴露 kvargs |
+| `predictor` 字段 | 追加在 `rte_qi_conf` 末尾（0 = 继承） | 兼容既有“0 继承”约定；实验期允许结构变更，代价是重编译 |

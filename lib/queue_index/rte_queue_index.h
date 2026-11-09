@@ -63,6 +63,29 @@ enum rte_qi_reason {
 };
 
 /**
+ * Predictor used to estimate the net accumulation rate and the time to full.
+ *
+ * The predictor only changes how net_pps and eta_us are derived; the
+ * trigger thresholds, the state machine and the published reasons are
+ * identical for all predictors.
+ */
+enum rte_qi_predictor {
+	RTE_QI_PRED_INHERIT = 0,
+	/**< Use the global predictor; only valid in rte_qi_conf. */
+	RTE_QI_PRED_PEAK,
+	/**< Windowed peak of the per-interval net rate (default).
+	 * Fastest response to a sudden consumer stall; sensitive to
+	 * balanced bursts. */
+	RTE_QI_PRED_EWMA,
+	/**< Exponentially weighted moving average of the net rate with a
+	 * fixed smoothing factor of 0.5. Smooths balanced bursts and lowers
+	 * the false alarm rate; ramps up over a few intervals. */
+	RTE_QI_PRED_LINREG,
+	/**< Least-squares slope of the occupancy over the window. Best for
+	 * slow drift on deep rings; use with a large window. */
+};
+
+/**
  * Per-ring configuration.
  *
  * A field set to 0 means "inherit the global value" when this structure is
@@ -88,6 +111,8 @@ struct rte_qi_conf {
 	/**< Minimum time to stay in WARN/CRITICAL after entering it. */
 	uint64_t min_net_pps;
 	/**< Minimum net accumulation rate considered for trend prediction. */
+	uint32_t predictor;
+	/**< Predictor selection, see enum rte_qi_predictor. 0 = inherit. */
 };
 
 /**
@@ -158,7 +183,7 @@ struct rte_qi_monitor_status {
  *   Comma-separated key=value list, or NULL to use defaults:
  *   lcore, sched, interval_us, min_interval_us, spin_us, window, high_wm,
  *   low_wm, warn_horizon_us, clear_horizon_us, confirm_samples,
- *   min_net_pps, hold_us, stagger, budget_pct, log, log_rate.
+ *   min_net_pps, hold_us, predictor, stagger, budget_pct, log, log_rate.
  * @return
  *   0 on success, -EINVAL on bad parameters, -ENOMEM on allocation failure,
  *   -EBUSY if already initialized.

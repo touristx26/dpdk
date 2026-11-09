@@ -260,6 +260,127 @@ test_qi_trend(void)
 }
 
 static int
+test_qi_predictors(void)
+{
+	struct rte_qi_ring_state st;
+	struct rte_qi_conf conf;
+	struct rte_ring *ring;
+	void *objs[128];
+	uint64_t hz, t0, tick;
+	uint32_t i;
+
+	/* predictor kvargs parsing */
+	RTE_TEST_ASSERT(rte_qi_init("predictor=linreg") == 0,
+			"linreg predictor init failed");
+	RTE_TEST_ASSERT(rte_qi_fini() == 0, "fini failed");
+	RTE_TEST_ASSERT(rte_qi_init("predictor=foo") == -EINVAL,
+			"invalid predictor must fail");
+
+	/* EWMA: steady accumulation must trigger a trend warning */
+	RTE_TEST_ASSERT(rte_qi_init("predictor=ewma,window=8") == 0,
+			"ewma init failed");
+
+	ring = rte_ring_create("qi_ut_ring_ewma", QI_TEST_RING_SIZE,
+			       SOCKET_ID_ANY, 0);
+	RTE_TEST_ASSERT(ring != NULL, "ring creation failed");
+
+	memset(&conf, 0, sizeof(conf));
+	conf.high_wm = 99;
+	conf.low_wm = 50;
+	conf.warn_horizon_us = 150;
+	conf.clear_horizon_us = 300;
+	conf.confirm_samples = 1;
+	conf.interval_us = 10;
+	conf.window = 8;
+	conf.min_net_pps = 1000000;
+	conf.predictor = RTE_QI_PRED_EWMA;
+
+	RTE_TEST_ASSERT(rte_qi_ring_register("qi_ut_ring_ewma", &conf) == 0,
+			"register failed");
+
+	hz = rte_get_tsc_hz();
+	tick = hz / 100000; /* 10 us */
+
+	for (i = 0; i < 100; i++)
+		objs[i] = qi_dummy_obj(i);
+
+	t0 = rte_rdtsc();
+	RTE_TEST_ASSERT(rte_qi_process_at(t0) == 1, "process failed");
+
+	/* 100 items per 10 us tick = 10 Mpps net accumulation */
+	for (i = 0; i < 4; i++) {
+		RTE_TEST_ASSERT(
+			rte_ring_enqueue_bulk(ring, objs, 100, NULL) == 100,
+			"enqueue failed");
+		RTE_TEST_ASSERT(rte_qi_process_at(t0 + (i + 1) * tick) == 1,
+				"process failed");
+	}
+
+	RTE_TEST_ASSERT(rte_qi_state_get("qi_ut_ring_ewma", &st) == 0,
+			"state get failed");
+	RTE_TEST_ASSERT(st.state == RTE_QI_WARN, "ewma trend must warn");
+	RTE_TEST_ASSERT((st.reasons & RTE_QI_REASON_TREND) != 0,
+			"trend reason missing");
+	RTE_TEST_ASSERT(st.eta_us < RTE_QI_ETA_INFINITE, "eta must be valid");
+	RTE_TEST_ASSERT(st.net_pps >= 1000000, "ewma net rate too low");
+
+	RTE_TEST_ASSERT(rte_qi_ring_unregister("qi_ut_ring_ewma") == 0,
+			"unregister failed");
+	rte_ring_free(ring);
+	RTE_TEST_ASSERT(rte_qi_fini() == 0, "fini failed");
+
+	/* LINREG: gradual fill must trigger a trend warning */
+	RTE_TEST_ASSERT(rte_qi_init("predictor=linreg,window=8") == 0,
+			"linreg init failed");
+
+	ring = rte_ring_create("qi_ut_ring_linreg", QI_TEST_RING_SIZE,
+			       SOCKET_ID_ANY, 0);
+	RTE_TEST_ASSERT(ring != NULL, "ring creation failed");
+
+	memset(&conf, 0, sizeof(conf));
+	conf.high_wm = 99;
+	conf.low_wm = 50;
+	conf.warn_horizon_us = 150;
+	conf.clear_horizon_us = 300;
+	conf.confirm_samples = 1;
+	conf.interval_us = 10;
+	conf.window = 8;
+	conf.min_net_pps = 1000000;
+	conf.predictor = RTE_QI_PRED_LINREG;
+
+	RTE_TEST_ASSERT(rte_qi_ring_register("qi_ut_ring_linreg", &conf) == 0,
+			"register failed");
+
+	t0 = rte_rdtsc();
+	RTE_TEST_ASSERT(rte_qi_process_at(t0) == 1, "process failed");
+
+	/* Linear ramp: 100 items per tick over 8 ticks fills the window
+	 * with a slope of 10 Mpps. */
+	for (i = 0; i < 8; i++) {
+		RTE_TEST_ASSERT(
+			rte_ring_enqueue_bulk(ring, objs, 100, NULL) == 100,
+			"enqueue failed");
+		RTE_TEST_ASSERT(rte_qi_process_at(t0 + (i + 1) * tick) == 1,
+				"process failed");
+	}
+
+	RTE_TEST_ASSERT(rte_qi_state_get("qi_ut_ring_linreg", &st) == 0,
+			"state get failed");
+	RTE_TEST_ASSERT(st.state == RTE_QI_WARN, "linreg trend must warn");
+	RTE_TEST_ASSERT((st.reasons & RTE_QI_REASON_TREND) != 0,
+			"trend reason missing");
+	RTE_TEST_ASSERT(st.eta_us < RTE_QI_ETA_INFINITE, "eta must be valid");
+	RTE_TEST_ASSERT(st.net_pps >= 1000000, "linreg slope too low");
+
+	RTE_TEST_ASSERT(rte_qi_ring_unregister("qi_ut_ring_linreg") == 0,
+			"unregister failed");
+	rte_ring_free(ring);
+	RTE_TEST_ASSERT(rte_qi_fini() == 0, "fini failed");
+
+	return 0;
+}
+
+static int
 test_qi_start_stop(void)
 {
 	struct rte_qi_monitor_status status;
@@ -297,6 +418,7 @@ test_queue_index(void)
 	RTE_TEST_ASSERT(test_qi_rts_reject() == 0, "RTS test failed");
 	RTE_TEST_ASSERT(test_qi_level() == 0, "level test failed");
 	RTE_TEST_ASSERT(test_qi_trend() == 0, "trend test failed");
+	RTE_TEST_ASSERT(test_qi_predictors() == 0, "predictors test failed");
 	RTE_TEST_ASSERT(test_qi_start_stop() == 0, "start/stop test failed");
 
 	return 0;
