@@ -86,6 +86,56 @@ enum rte_qi_predictor {
 };
 
 /**
+ * One sampling result returned by a queue provider.
+ *
+ * The provider is responsible for clamping count_lo/count_hi to capacity:
+ * count_lo <= count_hi <= capacity. A provider that can only observe a
+ * single occupancy value must set count_lo == count_hi.
+ *
+ * enq_total/deq_total are cumulative positions, not occupancies: the rate
+ * estimator differentiates them across samples to obtain the enqueue and
+ * dequeue rates separately. They may wrap (32-bit), because the library
+ * only ever uses differences within a window shorter than 2^32 elements.
+ */
+struct rte_qi_usage {
+	uint32_t capacity;
+	/**< Usable capacity of the queue. For an rte_ring this is
+	 * rte_ring_get_capacity(), i.e. size - 1, not size. */
+	uint32_t count_lo;
+	/**< Published occupancy, lower bound. */
+	uint32_t count_hi;
+	/**< Occupancy including reservations, upper bound. */
+	uint32_t enq_total;
+	/**< Cumulative enqueue position, used for enqueue rate. */
+	uint32_t deq_total;
+	/**< Cumulative dequeue position, used for dequeue rate. */
+};
+
+/**
+ * How the monitor observes a queue.
+ *
+ * The library only consumes the numbers in rte_qi_usage; the
+ * estimator, the state machine, the published snapshot and the query API
+ * are identical for every provider.
+ */
+struct rte_qi_queue_ops {
+	const char *name;
+	/**< Provider name, used in logs and diagnostics. */
+	int (*check)(void *queue);
+	/**< Optional registration-time validation. Returns 0 or a negative
+	 * errno (for example -ENOTSUP for an unsupported sync mode).
+	 * NULL means "always supported". */
+	int (*usage)(void *queue, struct rte_qi_usage *u);
+	/**< Sample the queue. Called on the monitor lcore only, so it may
+	 * be lock-free. Returns 0 on success; a negative errno makes the
+	 * monitor skip this ring for the current tick, keep the previously
+	 * published state and increment monitor_status::sample_errors. */
+	uint32_t cost_ns;
+	/**< Estimated cost of one usage() call, in nanoseconds. Used by the
+	 * startup CPU budget check. */
+};
+
+/**
  * Per-ring configuration.
  *
  * A field set to 0 means "inherit the global value" when this structure is
@@ -170,6 +220,10 @@ struct rte_qi_monitor_status {
 	/**< Number of iterations that overran a sampling period. */
 	uint64_t last_tick_ns;
 	/**< Timestamp of the last monitor iteration, in nanoseconds. */
+	uint64_t sample_errors;
+	/**< Number of skipped samples because a provider usage() call
+	 * failed. Non-zero usually means the monitored backend is
+	 * unreachable, for example a lost UB link. */
 	uint64_t generation;
 	/**< Incremented on every ring state transition. */
 };
@@ -224,6 +278,31 @@ int rte_qi_start(void);
  */
 __rte_experimental
 int rte_qi_stop(void);
+
+/**
+ * Register a queue with a caller-provided provider.
+ *
+ * This is the generic entry point; rte_qi_ring_register() and
+ * rte_qi_ring_register_ptr() are convenience wrappers around it for
+ * local rte_ring queues.
+ *
+ * @param queue
+ *   Opaque queue handle passed back to the provider callbacks.
+ * @param ops
+ *   Provider callbacks and sampling cost.
+ * @param alias
+ *   Name used for queries and logs; must be unique in the registry and is
+ *   copied into the slot. Required.
+ * @param conf
+ *   Per-ring configuration, or NULL to inherit everything.
+ * @return
+ *   0 on success, -EINVAL on NULL arguments or invalid configuration,
+ *   -EEXIST if the alias or the queue is already registered, -ENOSPC if
+ *   the registry is full, -ENOTSUP if check() rejects the queue.
+ */
+__rte_experimental
+int rte_qi_queue_register(void *queue, const struct rte_qi_queue_ops *ops,
+			  const char *alias, const struct rte_qi_conf *conf);
 
 /**
  * Register a ring by name.

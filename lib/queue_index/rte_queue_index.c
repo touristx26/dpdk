@@ -54,8 +54,9 @@ struct qi_global_conf {
 
 struct qi_sample {
 	uint64_t tsc;
-	uint32_t prod_tail;
-	uint32_t cons_tail;
+	uint32_t enq_total;
+	uint32_t deq_total;
+	uint32_t count_lo;
 	uint32_t count_hi;
 };
 
@@ -72,7 +73,9 @@ typedef void (*qi_predict_fn)(struct qi_slot *slot, uint64_t now,
 struct qi_slot {
 	RTE_ATOMIC(uint32_t) seq;
 	RTE_ATOMIC(uint32_t) in_use;
-	struct rte_ring *ring;
+	void *queue;
+	const struct rte_qi_queue_ops *ops;
+	uint32_t capacity;
 	char name[RTE_RING_NAMESIZE];
 	struct rte_qi_conf conf;
 	uint64_t interval_tsc;
@@ -98,6 +101,7 @@ struct qi_monitor {
 	RTE_ATOMIC(uint64_t) generation;
 	RTE_ATOMIC(uint64_t) ticks;
 	RTE_ATOMIC(uint64_t) missed_ticks;
+	RTE_ATOMIC(uint64_t) sample_errors;
 	RTE_ATOMIC(uint64_t) late_ticks;
 	RTE_ATOMIC(uint64_t) last_tick_ns;
 	uint32_t lcore;
@@ -496,36 +500,78 @@ qi_read_slot(struct qi_slot *slot, struct rte_qi_ring_state *st)
 	}
 }
 
-static void
-qi_read_counters(struct rte_ring *ring, uint32_t *prod_head,
-		 uint32_t *prod_tail, uint32_t *cons_tail)
+/*
+ * Provider: local rte_ring.
+ *
+ * Reads the producer/consumer cursors of a plain rte_ring, including the
+ * HTS variant. The modulo uses the ring mask because rte_ring cursors
+ * wrap at the ring size; queues whose cursors do not wrap mask their own
+ * values and return them through their usage() callback instead.
+ */
+static int
+qi_rte_ring_usage(void *queue, struct rte_qi_usage *u)
 {
+	struct rte_ring *ring = queue;
+	uint32_t prod_head, prod_tail, cons_tail;
 	enum rte_ring_sync_type prod_sync = rte_ring_get_prod_sync_type(ring);
 	enum rte_ring_sync_type cons_sync = rte_ring_get_cons_sync_type(ring);
 
 	if (prod_sync == RTE_RING_SYNC_MT_HTS) {
-		*prod_head = rte_atomic_load_explicit(
+		prod_head = rte_atomic_load_explicit(
 				&ring->hts_prod.ht.pos.head,
 				rte_memory_order_relaxed);
-		*prod_tail = rte_atomic_load_explicit(
+		prod_tail = rte_atomic_load_explicit(
 				&ring->hts_prod.ht.pos.tail,
 				rte_memory_order_relaxed);
 	} else {
-		*prod_head = rte_atomic_load_explicit(
+		prod_head = rte_atomic_load_explicit(
 				&ring->prod.head, rte_memory_order_relaxed);
-		*prod_tail = rte_atomic_load_explicit(
+		prod_tail = rte_atomic_load_explicit(
 				&ring->prod.tail, rte_memory_order_relaxed);
 	}
 
-	if (cons_sync == RTE_RING_SYNC_MT_HTS) {
-		*cons_tail = rte_atomic_load_explicit(
+	if (cons_sync == RTE_RING_SYNC_MT_HTS)
+		cons_tail = rte_atomic_load_explicit(
 				&ring->hts_cons.ht.pos.tail,
 				rte_memory_order_relaxed);
-	} else {
-		*cons_tail = rte_atomic_load_explicit(
+	else
+		cons_tail = rte_atomic_load_explicit(
 				&ring->cons.tail, rte_memory_order_relaxed);
-	}
+
+	u->capacity = rte_ring_get_capacity(ring);
+	u->count_lo = (prod_tail - cons_tail) & ring->mask;
+	u->count_hi = (prod_head - cons_tail) & ring->mask;
+	u->enq_total = prod_tail;
+	u->deq_total = cons_tail;
+
+	if (u->count_lo > u->capacity)
+		u->count_lo = u->capacity;
+	if (u->count_hi > u->capacity)
+		u->count_hi = u->capacity;
+
+	return 0;
 }
+
+static int
+qi_rte_ring_check(void *queue)
+{
+	struct rte_ring *ring = queue;
+
+	if (rte_ring_get_prod_sync_type(ring) == RTE_RING_SYNC_MT_RTS ||
+	    rte_ring_get_cons_sync_type(ring) == RTE_RING_SYNC_MT_RTS) {
+		RTE_LOG(ERR, QUEUE_INDEX, "RTS sync mode is not supported\n");
+		return -ENOTSUP;
+	}
+
+	return 0;
+}
+
+static const struct rte_qi_queue_ops qi_rte_ring_ops = {
+	.name = "rte_ring",
+	.check = qi_rte_ring_check,
+	.usage = qi_rte_ring_usage,
+	.cost_ns = QI_SAMPLE_COST_NS,
+};
 
 static void
 qi_compute_rates(const struct qi_slot *slot, uint64_t now,
@@ -562,8 +608,8 @@ qi_compute_rates(const struct qi_slot *slot, uint64_t now,
 	if (span == 0)
 		return;
 
-	*enq_pps = qi_rate(win[last].prod_tail - win[first].prod_tail, span);
-	*deq_pps = qi_rate(win[last].cons_tail - win[first].cons_tail, span);
+	*enq_pps = qi_rate(win[last].enq_total - win[first].enq_total, span);
+	*deq_pps = qi_rate(win[last].deq_total - win[first].deq_total, span);
 }
 
 /**
@@ -574,8 +620,8 @@ static void
 qi_finish_eta(const struct qi_slot *slot, uint32_t count_hi,
 	      uint64_t net_pps, uint64_t *eta_us)
 {
-	uint32_t capacity = rte_ring_get_capacity(slot->ring);
-	uint32_t free_slots = capacity > count_hi ? capacity - count_hi : 0;
+	uint32_t free_slots = slot->capacity > count_hi ?
+			      slot->capacity - count_hi : 0;
 
 	*eta_us = RTE_QI_ETA_INFINITE;
 	if (free_slots == 0)
@@ -609,9 +655,9 @@ qi_predict_peak(struct qi_slot *slot, uint64_t now __rte_unused,
 			if (delta_tsc == 0)
 				continue;
 
-			enq = qi_rate(win[cur].prod_tail - win[prev].prod_tail,
+			enq = qi_rate(win[cur].enq_total - win[prev].enq_total,
 				      delta_tsc);
-			deq = qi_rate(win[cur].cons_tail - win[prev].cons_tail,
+			deq = qi_rate(win[cur].deq_total - win[prev].deq_total,
 				      delta_tsc);
 			net = enq > deq ? enq - deq : 0;
 
@@ -644,10 +690,10 @@ qi_predict_ewma(struct qi_slot *slot, uint64_t now __rte_unused,
 
 		if (delta_tsc > 0) {
 			int64_t enq = (int64_t)qi_rate(
-				win[last].prod_tail - win[prev].prod_tail,
+				win[last].enq_total - win[prev].enq_total,
 				delta_tsc);
 			int64_t deq = (int64_t)qi_rate(
-				win[last].cons_tail - win[prev].cons_tail,
+				win[last].deq_total - win[prev].deq_total,
 				delta_tsc);
 
 			net_now = enq - deq;
@@ -662,8 +708,8 @@ qi_predict_ewma(struct qi_slot *slot, uint64_t now __rte_unused,
 }
 
 /**
- * LINREG predictor: least-squares slope of the unclamped occupancy
- * (prod_tail - cons_tail) over the window, in items per second.
+ * LINREG predictor: least-squares slope of the published occupancy
+ * (count_lo) over the window, in items per second.
  * Best for slow drift; requires at least 3 samples.
  */
 static void
@@ -686,12 +732,11 @@ qi_predict_linreg(struct qi_slot *slot, uint64_t now __rte_unused,
 	first = (slot->win_head + window - count) % window;
 
 	/* x: elapsed cycles since the first sample,
-	 * y: unclamped occupancy (prod_tail - cons_tail). */
+	 * y: published occupancy of that sample. */
 	for (i = 0; i < count; i++) {
 		uint32_t idx = (first + i) % window;
 		double x = (double)(win[idx].tsc - win[first].tsc);
-		double y = (double)((int64_t)win[idx].prod_tail -
-				    (int64_t)win[idx].cons_tail);
+		double y = (double)win[idx].count_lo;
 
 		sx += x;
 		sy += y;
@@ -768,28 +813,41 @@ static void
 qi_sample_slot(struct qi_slot *slot, uint64_t now)
 {
 	struct rte_qi_ring_state st;
+	struct rte_qi_usage usage;
 	struct qi_sample *sm;
-	uint32_t prod_head, prod_tail, cons_tail;
 	uint32_t capacity, count_lo, count_hi, peak_hi;
 	uint32_t reasons = 0, prev_state, next_state;
 	uint64_t enq_pps = 0, deq_pps = 0, net_pps;
 	uint64_t eta_us, now_ns;
 	bool level, trend, full, recovery;
 
-	qi_read_counters(slot->ring, &prod_head, &prod_tail, &cons_tail);
+	if (slot->ops->usage(slot->queue, &usage) != 0) {
+		/*
+		 * The provider could not be observed this tick. Keep the last
+		 * published snapshot instead of publishing a half-filled one,
+		 * so a transient backend failure does not look like a state
+		 * change or a recovery.
+		 */
+		rte_atomic_store_explicit(
+			&qi_mon.sample_errors,
+			rte_atomic_load_explicit(&qi_mon.sample_errors,
+						 rte_memory_order_relaxed) + 1,
+			rte_memory_order_relaxed);
+		return;
+	}
 
-	capacity = rte_ring_get_capacity(slot->ring);
-	count_lo = (prod_tail - cons_tail) & slot->ring->mask;
-	count_hi = (prod_head - cons_tail) & slot->ring->mask;
-	if (count_lo > capacity)
-		count_lo = capacity;
-	if (count_hi > capacity)
-		count_hi = capacity;
+	capacity = usage.capacity;
+	slot->capacity = capacity;
+	count_lo = usage.count_lo > capacity ? capacity : usage.count_lo;
+	count_hi = usage.count_hi > capacity ? capacity : usage.count_hi;
+	if (count_hi < count_lo)
+		count_hi = count_lo;
 
 	sm = &slot->win[slot->win_head];
 	sm->tsc = now;
-	sm->prod_tail = prod_tail;
-	sm->cons_tail = cons_tail;
+	sm->enq_total = usage.enq_total;
+	sm->deq_total = usage.deq_total;
+	sm->count_lo = count_lo;
 	sm->count_hi = count_hi;
 	slot->win_head = (slot->win_head + 1) % slot->conf.window;
 	if (slot->win_cnt < slot->conf.window)
@@ -1062,9 +1120,9 @@ qi_resolve_lcore(int *err)
 }
 
 static double
-qi_estimate_cpu_pct(uint32_t n_rings, uint32_t interval_us)
+qi_estimate_cpu_pct(uint32_t n_rings, uint32_t cost_ns, uint32_t interval_us)
 {
-	return (double)n_rings * QI_SAMPLE_COST_NS * 100.0 /
+	return (double)n_rings * (double)cost_ns * 100.0 /
 	       ((double)interval_us * 1000.0);
 }
 
@@ -1217,7 +1275,8 @@ rte_qi_start(void)
 	for (i = 0; i < qi_nactive; i++) {
 		struct qi_slot *slot = &qi_slots[qi_active[i]];
 
-		pct += qi_estimate_cpu_pct(1, slot->conf.interval_us);
+		pct += qi_estimate_cpu_pct(1, slot->ops->cost_ns,
+					   slot->conf.interval_us);
 	}
 	rte_rwlock_read_unlock(&qi_lock);
 
@@ -1310,30 +1369,37 @@ rte_qi_ring_register(const char *ring_name, const struct rte_qi_conf *conf)
 }
 
 int
-rte_qi_ring_register_ptr(struct rte_ring *ring, const char *alias,
-			 const struct rte_qi_conf *conf)
+rte_qi_queue_register(void *queue, const struct rte_qi_queue_ops *ops,
+		      const char *alias, const struct rte_qi_conf *conf)
 {
 	struct rte_qi_conf merged;
+	struct rte_qi_usage usage;
 	const char *name;
 	uint32_t i;
 	int free_idx = -1;
 
-	if (!qi_initialized || ring == NULL)
+	if (!qi_initialized || queue == NULL || ops == NULL ||
+	    ops->usage == NULL || alias == NULL)
 		return -EINVAL;
 
-	if (rte_ring_get_prod_sync_type(ring) == RTE_RING_SYNC_MT_RTS ||
-	    rte_ring_get_cons_sync_type(ring) == RTE_RING_SYNC_MT_RTS) {
-		RTE_LOG(ERR, QUEUE_INDEX,
-			"RTS sync mode is not supported\n");
-		return -ENOTSUP;
+	if (ops->check != NULL) {
+		int ret = ops->check(queue);
+
+		if (ret != 0)
+			return ret;
 	}
 
-	name = alias != NULL ? alias : ring->name;
+	name = alias;
 	if (name[0] == '\0' || strlen(name) >= RTE_RING_NAMESIZE)
 		return -EINVAL;
 
 	qi_fill_conf(&merged, conf);
 	if (qi_check_conf(&merged) < 0)
+		return -EINVAL;
+
+	/* One probe now fixes the capacity and rejects unusable queues
+	 * before they enter the registry. */
+	if (ops->usage(queue, &usage) != 0 || usage.capacity == 0)
 		return -EINVAL;
 
 	rte_rwlock_write_lock(&qi_lock);
@@ -1347,7 +1413,7 @@ rte_qi_ring_register_ptr(struct rte_ring *ring, const char *alias,
 			continue;
 		}
 
-		if (slot->ring == ring ||
+		if (slot->queue == queue ||
 		    strncmp(slot->name, name, RTE_RING_NAMESIZE) == 0) {
 			rte_rwlock_write_unlock(&qi_lock);
 			return -EEXIST;
@@ -1363,7 +1429,9 @@ rte_qi_ring_register_ptr(struct rte_ring *ring, const char *alias,
 		struct qi_slot *slot = &qi_slots[free_idx];
 
 		memset(slot, 0, sizeof(*slot));
-		slot->ring = ring;
+		slot->queue = queue;
+		slot->ops = ops;
+		slot->capacity = usage.capacity;
 		qi_name_set(slot->name, name);
 		slot->conf = merged;
 		slot->interval_tsc = qi_us_to_tsc(merged.interval_us);
@@ -1375,7 +1443,7 @@ rte_qi_ring_register_ptr(struct rte_ring *ring, const char *alias,
 		memset(&slot->pub, 0, sizeof(slot->pub));
 		qi_name_set(slot->pub.name, name);
 		slot->pub.state = RTE_QI_UNKNOWN;
-		slot->pub.capacity = rte_ring_get_capacity(ring);
+		slot->pub.capacity = usage.capacity;
 		slot->pub.eta_us = RTE_QI_ETA_INFINITE;
 
 		rte_atomic_store_explicit(&slot->seq, 0,
@@ -1388,6 +1456,17 @@ rte_qi_ring_register_ptr(struct rte_ring *ring, const char *alias,
 	rte_rwlock_write_unlock(&qi_lock);
 
 	return 0;
+}
+
+int
+rte_qi_ring_register_ptr(struct rte_ring *ring, const char *alias,
+			 const struct rte_qi_conf *conf)
+{
+	if (ring == NULL)
+		return -EINVAL;
+
+	return rte_qi_queue_register(ring, &qi_rte_ring_ops,
+				     alias != NULL ? alias : ring->name, conf);
 }
 
 int
@@ -1527,6 +1606,8 @@ rte_qi_monitor_status(struct rte_qi_monitor_status *st)
 					     rte_memory_order_relaxed);
 	st->missed_ticks = rte_atomic_load_explicit(&qi_mon.missed_ticks,
 						    rte_memory_order_relaxed);
+	st->sample_errors = rte_atomic_load_explicit(&qi_mon.sample_errors,
+						     rte_memory_order_relaxed);
 	st->late_ticks = rte_atomic_load_explicit(&qi_mon.late_ticks,
 						  rte_memory_order_relaxed);
 	st->last_tick_ns = rte_atomic_load_explicit(&qi_mon.last_tick_ns,

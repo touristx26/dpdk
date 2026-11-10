@@ -7,6 +7,7 @@ EXPERIMENTAL {
 	rte_qi_init;
 	rte_qi_monitor_status;
 	rte_qi_process_at;
+	rte_qi_queue_register;
 	rte_qi_ring_handle_get;
 	rte_qi_ring_register;
 	rte_qi_ring_register_ptr;

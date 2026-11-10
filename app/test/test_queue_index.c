@@ -2,6 +2,7 @@
  * Copyright(c) 2026 Queue Index authors
  */
 
+#include <errno.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -14,6 +15,31 @@
 #include "test.h"
 
 #define QI_TEST_RING_SIZE 1024
+
+/* Mock backend used to prove that the monitor only depends on the
+ * provider contract, not on struct rte_ring. */
+static struct rte_qi_usage mock_usage;
+static int mock_fail;
+static int mock_queue;
+
+static int
+qi_mock_usage(void *queue, struct rte_qi_usage *u)
+{
+	RTE_TEST_ASSERT(queue == &mock_queue, "unexpected queue handle");
+
+	if (mock_fail)
+		return -EIO;
+
+	*u = mock_usage;
+	return 0;
+}
+
+static const struct rte_qi_queue_ops mock_ops = {
+	.name = "mock",
+	.check = NULL,
+	.usage = qi_mock_usage,
+	.cost_ns = 100,
+};
 
 static void *
 qi_dummy_obj(uint32_t i)
@@ -381,6 +407,76 @@ test_qi_predictors(void)
 }
 
 static int
+test_qi_provider(void)
+{
+	struct rte_qi_ring_state st;
+	struct rte_qi_monitor_status ms;
+	struct rte_qi_conf conf;
+	uint64_t hz, t0;
+	int ret;
+
+	RTE_TEST_ASSERT(rte_qi_init("interval_us=10,window=4,"
+				    "min_net_pps=1000000") == 0,
+			"init failed");
+
+	/* A generic queue: not a rte_ring, the occupancy is owned by the
+	 * mock provider. This is how a remote or non-rte_ring backend is
+	 * registered. */
+	memset(&mock_usage, 0, sizeof(mock_usage));
+	mock_usage.capacity = 100;
+	mock_usage.count_lo = 60;
+	mock_usage.count_hi = 60;
+	mock_usage.enq_total = 60;
+	mock_usage.deq_total = 0;
+	mock_fail = 0;
+
+	memset(&conf, 0, sizeof(conf));
+	conf.high_wm = 50;
+	conf.low_wm = 25;
+	conf.warn_horizon_us = 100;
+	conf.clear_horizon_us = 200;
+	conf.confirm_samples = 1;
+	conf.interval_us = 10;
+	conf.window = 4;
+	conf.min_net_pps = 1000000;
+
+	ret = rte_qi_queue_register(&mock_queue, &mock_ops, "qi_ut_mock",
+				    &conf);
+	RTE_TEST_ASSERT(ret == 0, "queue register failed, got %d", ret);
+
+	hz = rte_get_tsc_hz();
+	t0 = rte_rdtsc();
+	RTE_TEST_ASSERT(rte_qi_process_at(t0) == 1, "process failed");
+	RTE_TEST_ASSERT(rte_qi_state_get("qi_ut_mock", &st) == 0,
+			"state get failed");
+	RTE_TEST_ASSERT(st.state == RTE_QI_WARN, "level must trigger");
+	RTE_TEST_ASSERT(st.capacity == 100, "capacity not taken from ops");
+	RTE_TEST_ASSERT(st.count_hi == 60 && st.count_lo == 60,
+			"occupancy not taken from ops");
+
+	/* A failing provider keeps the last published state and is counted
+	 * in sample_errors instead of publishing a bogus transition. */
+	mock_fail = 1;
+	RTE_TEST_ASSERT(rte_qi_process_at(t0 + hz / 100000) == 1,
+			"process failed");
+	RTE_TEST_ASSERT(rte_qi_state_get("qi_ut_mock", &st) == 0,
+			"state get failed");
+	RTE_TEST_ASSERT(st.state == RTE_QI_WARN,
+			"state must survive a failing sample");
+	RTE_TEST_ASSERT(st.count_hi == 60, "stale occupancy must be kept");
+
+	RTE_TEST_ASSERT(rte_qi_monitor_status(&ms) == 0, "status failed");
+	RTE_TEST_ASSERT(ms.sample_errors == 1,
+			"sample_errors must count the failed sample");
+
+	RTE_TEST_ASSERT(rte_qi_ring_unregister("qi_ut_mock") == 0,
+			"unregister failed");
+	RTE_TEST_ASSERT(rte_qi_fini() == 0, "fini failed");
+
+	return 0;
+}
+
+static int
 test_qi_start_stop(void)
 {
 	struct rte_qi_monitor_status status;
@@ -419,6 +515,7 @@ test_queue_index(void)
 	RTE_TEST_ASSERT(test_qi_level() == 0, "level test failed");
 	RTE_TEST_ASSERT(test_qi_trend() == 0, "trend test failed");
 	RTE_TEST_ASSERT(test_qi_predictors() == 0, "predictors test failed");
+	RTE_TEST_ASSERT(test_qi_provider() == 0, "provider test failed");
 	RTE_TEST_ASSERT(test_qi_start_stop() == 0, "start/stop test failed");
 
 	return 0;
