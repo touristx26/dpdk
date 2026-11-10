@@ -909,10 +909,23 @@ EXPERIMENTAL {
 
 ### 17.2 集成测试
 
+独立示例程序 `examples/queue_index`（构建：`-Dexamples=queue_index`）用 4 个 lcore
+自动执行下列场景并打印量化结果，退出码 0/1 表示 PASS/FAIL：
+
+| 阶段 | 内容 | 判定 |
+|---|---|---|
+| A | producer 30 Mpps、consumer 略快（无压力），持续 1 s | 误报数 = 0 |
+| B | consumer 停摆 300 ms | WARN 早于首次入队失败，提前量 ≥ 50 µs；ETA 误差 ≤ 50% |
+| C | consumer 以 60 Mpps 排空积压 | 恢复延迟 ≤ 5 ms |
+| D | consumer 降到 29 Mpps | 水位告警提前量 ≥ 1 ms |
+| E | monitor | `missed_ticks` / `late_ticks` 观测 |
+
+完整用例：
+
 | 用例 | 内容 |
 |---|---|
-| I1 | 2 个 lcore：一个跑 monitor，一个跑 30 Mpps 入队/出队，观察 WARN 时序 |
-| I2 | 下游停摆，验证 CRITICAL 与日志 |
+| I1 | 4 个 lcore：control / producer / consumer / monitor，观察 WARN 时序 |
+| I2 | 下游停摆，验证 CRITICAL 与首次丢包时刻的对照 |
 | I3 | 恢复流量，验证滞回与恢复日志 |
 | I4 | `stagger=0/1` 对比 monitor CPU 与数据面 pps |
 | I5 | 跨 NUMA 采样，记录干扰差异 |
