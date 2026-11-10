@@ -8,5 +8,5 @@ if not is_linux
 endif
 
 allow_experimental_apis = true
-deps = ['eal', 'ring', 'queue_index']
+deps = ['eal', 'ring', 'queue_index', 'ethdev', 'mbuf', 'mempool']
 sources = files('main.c')

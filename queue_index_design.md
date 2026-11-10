@@ -930,6 +930,31 @@ EXPERIMENTAL {
 | I4 | `stagger=0/1` 对比 monitor CPU 与数据面 pps |
 | I5 | 跨 NUMA 采样，记录干扰差异 |
 
+### 17.2.1 网卡接入模式（`--nic`）
+
+示例程序支持把真实网卡收包接入验证：为每个 RX 队列创建一个 `rte_ring`，
+RX lcore 把 `rte_eth_rx_burst()` 收到的 mbuf 批量入队，独立 drain lcore 出队并释放，
+control lcore 周期打印「ring 真实占用」与「queue_index 标记」的对照。
+
+| 角色 | 数量 | 工作 |
+|---|---|---|
+| main | 1 | 参数解析、周期打印、超时/SIGINT 收尾 |
+| RX | 每队列 1 个 | `rx_burst` → `enqueue_burst`，入队失败立即释放 mbuf 并计数 |
+| drain | 1 | 轮询所有 ring 出队并 `rte_mbuf_free`，可限速 |
+| monitor | 1 | `queue_index` 采样 lcore（`sched=spin`、`interval_us=10`） |
+
+ring 为 `RING_F_SP_ENQ | RING_F_SC_DEQ`（每 ring 单生产者、单消费者），
+注册名 `qi_rxq_<qid>`；容量与 `--ring-size` 一致。
+drain 速率低于入队速率时 ring 会持续上涨，可在打印中同时观察
+`real=count/capacity`、`qi=state`、`reasons`、`net_pps`、`eta_us`。
+
+```bash
+build/examples/dpdk-queue_index --no-huge -m 512 -l 0-3 -- \
+    --nic --port=0 --rxq=1 --duration=30 --print-ms=1000 --drain-mpps=10
+```
+
+lcore 需求为 `1 + RX 队列数 + 2`；`--drain-mpps=0` 表示不限速（ring 基本为空）。
+
 ### 17.3 数值精度
 
 - 速率：`(double)Δitems * 1e9 / Δns`，或 128 位整数；
